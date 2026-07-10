@@ -7,7 +7,7 @@
 MuScriptor is a multi-instrument music transcription model developed by [Kyutai](https://kyutai.org) and [Mirelo](https://www.mirelo.ai).
 MuScriptor is the first music transcription model that has been trained on a large scale dataset of 170k songs from classical music to heavy metal.
 
-[Online Demo](https://muscriptor.kyutai.org) | [Paper] (coming soon) | [HuggingFace](https://huggingface.co/MuScriptor)
+[Online Demo](https://muscriptor.kyutai.org) | [Paper](https://arxiv.org/abs/2607.08168v1) | [HuggingFace](https://huggingface.co/MuScriptor)
 
 <!-- TODO: record the demo GIF (web UI piano roll), save it as assets/demo.gif,
      then uncomment:
