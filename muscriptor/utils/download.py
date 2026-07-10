@@ -1,6 +1,7 @@
 """Weight download utility with caching in ~/.cache/muscriptor/."""
 
 import hashlib
+import os
 import urllib.request
 from pathlib import Path
 from huggingface_hub import hf_hub_download
@@ -40,7 +41,15 @@ def download_if_necessary(url: str | Path) -> Path:
         if dest.exists():
             return dest
         print(f"Downloading {filename} …")
-        urllib.request.urlretrieve(url, dest)
+        # Download to a per-process temp file, then rename: an interrupted or
+        # concurrent download must never leave a partial file at `dest`, where
+        # it would be mistaken for a complete one forever after.
+        tmp = dest.with_name(f"{dest.name}.part{os.getpid()}")
+        try:
+            urllib.request.urlretrieve(url, tmp)
+            os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
         return dest
 
     # Local file — nothing to download, just check it's there.

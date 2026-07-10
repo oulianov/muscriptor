@@ -22,14 +22,16 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
+from muscriptor.soundfonts import SF3_URL
 from muscriptor.tokenizer.mt3 import MT3_FULL_PLUS_GROUP_NAMES
 from muscriptor.transcription_model import TranscriptionModel
 from muscriptor.utils.audio import _read_non_wav_file, _read_wav_file
+from muscriptor.utils.download import download_if_necessary
 
 
 def _make_release_once(lock: threading.Lock):
@@ -84,6 +86,16 @@ def create_app(model: TranscriptionModel, web_dir: str | Path | None = None) -> 
     @app.get("/instruments")
     async def list_instruments():
         return {"instruments": list(MT3_FULL_PLUS_GROUP_NAMES.keys())}
+
+    @app.get("/soundfonts/MuseScore_General.sf3")
+    async def soundfont() -> FileResponse:
+        """Compressed soundfont for the web UI's in-browser synthesizer.
+
+        Fetched from SF3_URL on first request (in a worker thread, so the
+        event loop keeps serving) and cached locally.
+        """
+        path = await asyncio.to_thread(download_if_necessary, SF3_URL)
+        return FileResponse(path, media_type="application/octet-stream")
 
     @app.post("/transcribe")
     async def transcribe(

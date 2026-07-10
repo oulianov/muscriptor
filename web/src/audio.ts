@@ -5,8 +5,9 @@ import workletUrl from "spessasynth_lib/dist/spessasynth_processor.min.js?url";
 /**
  * Playback goes through spessasynth_lib, a full SoundFont synthesizer running
  * in an AudioWorklet, fed with MuseScore_General.sf3 (the vorbis-compressed
- * build of the same soundfont the backend's fluidsynth /auralize uses, served
- * from /soundfonts/ — see web/scripts/prepare-soundfonts.mjs).
+ * build of the same soundfont the backend's fluidsynth /auralize uses). The
+ * backend serves it at /soundfonts/ from a locally-cached download — see
+ * muscriptor/soundfonts.py.
  */
 const SOUNDFONT_URL = "/soundfonts/MuseScore_General.sf3";
 

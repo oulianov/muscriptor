@@ -7,8 +7,6 @@
   "scripts": {
     "dev": "vite",
     "dev:proxy": "BACKEND_URL=https://muscriptor.kyutai.org vite",
-    "soundfonts": "node scripts/prepare-soundfonts.mjs",
-    "prebuild": "pnpm run soundfonts",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },

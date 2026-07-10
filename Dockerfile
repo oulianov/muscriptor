@@ -8,14 +8,8 @@ RUN corepack enable
 COPY web/package.json web/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
-# Download the soundfonts: the .sf3 the frontend streams from /soundfonts/,
-# and the .sf2 for /auralize (to /MuseScore_General.sf2, one level above the
-# package root — the runtime stage copies it from here). Runs in its own
-# layer so day-to-day source changes don't re-trigger the 253 MB download.
-COPY web/scripts/prepare-soundfonts.mjs scripts/
-RUN node scripts/prepare-soundfonts.mjs
-
 COPY web/ ./
+# vite outDir is ../muscriptor/web_dist, i.e. /muscriptor/web_dist in this stage.
 RUN pnpm run build
 
 
@@ -38,15 +32,24 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     uv sync --no-install-project
 
+# Pre-fetch the soundfonts (253 MB: .sf2 for /auralize, .sf3 for the web UI)
+# into the HF hub cache so a fresh container doesn't download them on first
+# use. Runs off just the two files it needs, before the full source COPY,
+# so day-to-day code changes don't re-trigger the download.
+COPY muscriptor/soundfonts.py muscriptor/utils/download.py /tmp/prewarm/
+RUN /app/.venv/bin/python -c "\
+import sys; sys.path.insert(0, '/tmp/prewarm'); \
+import soundfonts, download; \
+download.download_if_necessary(soundfonts.SF2_URL); \
+download.download_if_necessary(soundfonts.SF3_URL)" \
+    && rm -rf /tmp/prewarm
+
 COPY pyproject.toml uv.lock README.md ./
-# SoundFont for auralization; auralize() defaults to <repo-root>/MuseScore_General.sf2.
-# Reuse the copy the web-builder stage downloaded — no need for it in the context.
-COPY --from=web-builder /MuseScore_General.sf2 ./
 COPY muscriptor/ ./muscriptor/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync
 
-COPY --from=web-builder /web/dist ./web/dist
+COPY --from=web-builder /muscriptor/web_dist ./muscriptor/web_dist
 
 
 EXPOSE 8000

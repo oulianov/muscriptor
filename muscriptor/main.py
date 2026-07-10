@@ -137,8 +137,8 @@ def transcribe(
         typer.Option(
             "--soundfont",
             help=(
-                "Path to a .sf2 SoundFont for auralization. "
-                "Defaults to the bundled MuseScore_General.sf2."
+                "Path to a .sf2 SoundFont for auralization. Defaults to "
+                "MuseScore_General.sf2, downloaded once and cached locally."
             ),
         ),
     ] = None,
@@ -307,7 +307,7 @@ def serve(
     _device = None if device == "auto" else device
     typer.echo("Loading model…")
     model = TranscriptionModel.load_model(weights_path=model_path, device=_device)
-    web_dir = Path(__file__).resolve().parent.parent / "web" / "dist"
+    web_dir = Path(__file__).resolve().parent / "web_dist"
     fastapi_app = create_app(model, web_dir=web_dir if web_dir.is_dir() else None)
     uvicorn.run(fastapi_app, host=host, port=port)
 

@@ -7,9 +7,9 @@
 *.mid
 .venv
 web/node_modules
-web/dist
-# Regenerated inside the web-builder stage from MuseScore_General.sf2.
-web/public/soundfonts
+# Built fresh in the web-builder stage; a stale local build must not leak
+# into the runtime image via `COPY muscriptor/`.
+muscriptor/web_dist
 .git
 .gitignore
 __pycache__

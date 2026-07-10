@@ -242,11 +242,15 @@ uv sync
 cd web && pnpm install && pnpm run build && cd ..
 ```
 
-`pnpm run build` is required once — the FastAPI server auto-mounts
-`web/dist/` if it exists. The first build downloads two soundfonts:
-`MuseScore_General.sf2` (215 MB, to the repo root, used by `/auralize`) and
-`MuseScore_General.sf3` (38 MB, the compressed build the UI plays); later
-builds skip files already on disk.
+`pnpm run build` is required once — it outputs to `muscriptor/web_dist/`,
+which the FastAPI server auto-mounts if it exists (and which ships inside
+the PyPI wheel, so `uvx muscriptor serve` works without a checkout).
+
+The soundfonts are not bundled: the server fetches
+`MuseScore_General.sf2` (215 MB, used by `/auralize`) and
+`MuseScore_General.sf3` (38 MB, the compressed build the UI plays) from
+[MuScriptor/assets](https://huggingface.co/MuScriptor/assets) on first use
+and caches them locally (see `muscriptor/soundfonts.py`).
 
 ### Run
 
@@ -271,8 +275,8 @@ a WAV onto the page.
   is local-only.
 - Playback runs a full SoundFont synthesizer ([SpessaSynth](https://github.com/spessasus/spessasynth_lib))
   in the browser, fed with `MuseScore_General.sf3` — the same soundfont the
-  `/auralize` endpoint uses, served by the app itself from `/soundfonts/`,
-  no third-party CDN.
+  `/auralize` endpoint uses, served by the app itself from `/soundfonts/`
+  (cached server-side), no third-party CDN.
 
 ## License
 

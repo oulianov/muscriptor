@@ -45,6 +45,11 @@ Issues = "https://github.com/muscriptor/muscriptor/issues"
 [project.scripts]
 muscriptor = "muscriptor.main:main"
 
+[tool.hatch.build]
+# The built frontend is gitignored but must ship in the sdist/wheel so that
+# `uvx muscriptor serve` has a UI. Built by `pnpm build` in web/.
+artifacts = ["muscriptor/web_dist"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["muscriptor"]
 

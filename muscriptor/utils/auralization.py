@@ -16,9 +16,14 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
+from muscriptor.soundfonts import SF2_URL
 from muscriptor.utils.audio import load_audio
+from muscriptor.utils.download import download_if_necessary
 
-_DEFAULT_SOUNDFONT = Path(__file__).parent.parent.parent / "MuseScore_General.sf2"
+# Pre-downloaded copy at the repo root (kept for checkouts and Docker images
+# that already have one); absent that, the soundfont is fetched from SF2_URL
+# and cached under ~/.cache/muscriptor/.
+_LOCAL_SOUNDFONT = Path(__file__).parent.parent.parent / "MuseScore_General.sf2"
 _SAMPLE_RATE = 44100
 
 
@@ -29,12 +34,16 @@ def _load_mono_44k(path: Path) -> np.ndarray:
 
 
 def _resolve_soundfont(soundfont_path: str | Path | None) -> Path:
-    soundfont_path = Path(soundfont_path) if soundfont_path else _DEFAULT_SOUNDFONT
+    if soundfont_path is None:
+        if _LOCAL_SOUNDFONT.exists():
+            return _LOCAL_SOUNDFONT
+        return download_if_necessary(SF2_URL)
+    soundfont_path = Path(soundfont_path)
     if not soundfont_path.exists():
         raise FileNotFoundError(
             f"SoundFont not found: {soundfont_path}\n"
-            "Pass --soundfont /path/to/file.sf2 or ensure the bundled "
-            "MuseScore_General.sf2 is present in the muscriptor project root."
+            "Pass --soundfont /path/to/file.sf2, or omit it to use "
+            "MuseScore_General.sf2 (downloaded once and cached)."
         )
     return soundfont_path
 
@@ -85,8 +94,9 @@ def synthesize(
     Args:
         midi_path: Path to the MIDI file to synthesize.
         output_path: Destination WAV file path.
-        soundfont_path: Path to a ``.sf2`` SoundFont file.
-            Defaults to the bundled MuseScore_General.sf2.
+        soundfont_path: Path to a ``.sf2`` SoundFont file.  Defaults to
+            MuseScore_General.sf2, downloaded on first use and cached
+            locally (see :mod:`muscriptor.soundfonts`).
 
     Raises:
         RuntimeError: If fluidsynth is not available or fails.
@@ -112,8 +122,9 @@ def auralize(
         midi_path: Path to the MIDI file to synthesize.
         original_audio_path: Path to the source audio file (any format soundfile supports).
         output_path: Destination WAV file path.
-        soundfont_path: Path to a ``.sf2`` SoundFont file.
-            Defaults to the bundled MuseScore_General.sf2.
+        soundfont_path: Path to a ``.sf2`` SoundFont file.  Defaults to
+            MuseScore_General.sf2, downloaded on first use and cached
+            locally (see :mod:`muscriptor.soundfonts`).
 
     Raises:
         RuntimeError: If fluidsynth is not available or fails.
