@@ -2,7 +2,7 @@
 
 import torch
 
-from muscriptor.modules.streaming import increment_steps, init_states
+from muscriptor.modules.streaming import compact_states, increment_steps, init_states
 from muscriptor.modules.transformer import (
     create_sin_embedding,
     StreamingTransformer,
@@ -108,3 +108,36 @@ def test_streaming_transformer_fresh_state():
     with torch.no_grad():
         out = model(x, model_state=state)
     assert out.shape == (1, 3, 32)
+
+
+def test_compacted_streaming_state_matches_independently_decoded_rows():
+    torch.manual_seed(0)
+    model = _make_transformer()
+    model.eval()
+    inputs = torch.randn(4, 4, 32)
+    keep = torch.tensor([1, 3])
+    full_state = init_states(
+        model, batch_size=4, sequence_length=4, initialize_cache=False
+    )
+    kept_state = init_states(
+        model, batch_size=2, sequence_length=4, initialize_cache=False
+    )
+
+    with torch.no_grad():
+        for timestep in range(3):
+            model(
+                inputs[:, timestep : timestep + 1],
+                model_state=full_state,
+            )
+            model(
+                inputs[keep, timestep : timestep + 1],
+                model_state=kept_state,
+            )
+            increment_steps(model, full_state)
+            increment_steps(model, kept_state)
+
+        compact_states(full_state, keep)
+        compacted_output = model(inputs[keep, 3:4], model_state=full_state)
+        independent_output = model(inputs[keep, 3:4], model_state=kept_state)
+
+    assert torch.allclose(compacted_output, independent_output, atol=1e-5, rtol=1e-5)

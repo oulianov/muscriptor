@@ -348,6 +348,7 @@ class TranscriptionModel:
         no_eos_is_ok: bool = True,
         beam_size: int = 1,
         prelude_forcing: bool = True,
+        optimized_decoding: bool | None = None,
     ) -> Iterator[NoteStartEvent | NoteEndEvent | ProgressEvent]:
         """Transcribe audio into a stream of note events.
 
@@ -377,6 +378,10 @@ class TranscriptionModel:
         only care about notes can ignore them.
         """
         batch_size = self._resolve_batch_size(batch_size, prelude_forcing)
+        if optimized_decoding is None:
+            optimized_decoding = os.environ.get(
+                "MUSCRIPTOR_OPTIMIZED_DECODING", "0"
+            ).lower() in {"1", "true", "yes", "on"}
 
         # Exact names only here — the CLI resolves abbreviations before
         # calling in (resolve_instrument_names).
@@ -444,6 +449,7 @@ class TranscriptionModel:
                 no_eos_is_ok,
                 prelude_forcing,
                 beam_size,
+                optimized_decoding,
                 forbidden_tokens,
             ),
             self._tokenizer._vocab,
@@ -495,6 +501,7 @@ class TranscriptionModel:
         no_eos_is_ok: bool,
         prelude_forcing: bool = True,
         beam_size: int = 1,
+        optimized_decoding: bool = False,
         forbidden_tokens: torch.Tensor | None = None,
     ) -> Iterator[int | ChunkBoundary | ProgressEvent]:
         """Generate tokens and yield them per chunk, as soon as they are ready.
@@ -586,8 +593,42 @@ class TranscriptionModel:
                     )
             yield bnd
 
+            optimized_batch = (
+                optimized_decoding
+                and operator_profile is None
+                and prompt is None
+            )
+            generation_stats: dict[str, int] = {}
+
+            def emit_row(row: list[int]) -> Iterator[int | ChunkBoundary]:
+                nonlocal active, first_token_seconds, generated_steps
+                generated_steps += 1
+                if first_token_seconds is None:
+                    first_token_seconds = time.perf_counter() - batch_started_at
+                for j in range(n):
+                    if done[j]:
+                        continue
+                    tok = row[j]
+                    if tok == eos_id:
+                        done[j] = True
+                        eos_steps[j] = generated_steps
+                    else:
+                        if tracker is not None:
+                            tracker.feed(tok)
+                        if j == active:
+                            yield tok
+                        else:
+                            buffers[j].append(tok)
+                # When the live chunk finishes, flush and stream the next one(s).
+                while active < n and done[active]:
+                    active += 1
+                    if active < n:
+                        yield boundary(batch_start + active)
+                        yield from buffers[active]
+                        buffers[active] = []
+
             try:
-                for step in self._model.generate(
+                generated = self._model.generate(
                     prompt=prompt,
                     conditions=batch_conditions,
                     max_gen_len=max_gen_len,
@@ -599,42 +640,33 @@ class TranscriptionModel:
                     early_stop_on_token=eos_id,
                     beam_size=beam_size,
                     forbidden_tokens=forbidden_tokens,
-                ):
-                    generated_steps += 1
-                    if first_token_seconds is None:
-                        first_token_seconds = time.perf_counter() - batch_started_at
-                    row = step.tolist()  # one token per chunk: [n]
-                    for j in range(n):
-                        if done[j]:
-                            continue
-                        tok = row[j]
-                        if tok == eos_id:
-                            done[j] = True
-                            eos_steps[j] = generated_steps
-                        else:
-                            if tracker is not None:
-                                tracker.feed(tok)
-                            if j == active:
-                                yield tok
-                            else:
-                                buffers[j].append(tok)
-                    # When the live chunk finishes, flush and stream the next one(s).
-                    while active < n and done[active]:
-                        active += 1
-                        if active < n:
-                            yield boundary(batch_start + active)
-                            yield from buffers[active]
-                            buffers[active] = []
-
-                    if (
-                        operator_profile is not None
-                        and generated_steps >= profile_steps
-                    ):
-                        operator_profile.__exit__(None, None, None)
-                        operator_profile_table = operator_profile.key_averages().table(
-                            sort_by="self_cuda_time_total", row_limit=30
-                        )
-                        operator_profile = None
+                    optimized_decoding=optimized_batch,
+                    eos_check_interval=16,
+                    generation_stats=(generation_stats if optimized_batch else None),
+                )
+                if optimized_batch:
+                    device_steps = list(generated)
+                    rows = (
+                        torch.stack(device_steps, dim=0).cpu().tolist()
+                        if device_steps
+                        else []
+                    )
+                    for row in rows:
+                        yield from emit_row(row)
+                else:
+                    for step in generated:
+                        yield from emit_row(step.tolist())
+                        if (
+                            operator_profile is not None
+                            and generated_steps >= profile_steps
+                        ):
+                            operator_profile.__exit__(None, None, None)
+                            operator_profile_table = (
+                                operator_profile.key_averages().table(
+                                    sort_by="self_cuda_time_total", row_limit=30
+                                )
+                            )
+                            operator_profile = None
             finally:
                 if operator_profile is not None:
                     operator_profile.__exit__(None, None, None)
@@ -645,8 +677,15 @@ class TranscriptionModel:
             muscriptor.accelerator.synchronize()
             batch_finished_at = time.perf_counter()
             batch_seconds = batch_finished_at - batch_started_at
-            model_tokens = generated_steps * n
             completed_steps = [step or generated_steps for step in eos_steps]
+            scheduled_tokens = generation_stats.get(
+                "scheduled_row_steps", generated_steps * n
+            )
+            useful_tokens = sum(completed_steps)
+            wasted_tokens = max(0, scheduled_tokens - useful_tokens)
+            waste_percentage = (
+                wasted_tokens / scheduled_tokens * 100 if scheduled_tokens else 0
+            )
             eos_summary = "none"
             if completed_steps:
                 eos_summary = (
@@ -662,12 +701,20 @@ class TranscriptionModel:
                     f" peak_allocated={torch.cuda.max_memory_allocated(self._device) / 2**30:.2f}GiB"
                     f" peak_reserved={torch.cuda.max_memory_reserved(self._device) / 2**30:.2f}GiB"
                 )
+            first_token = (
+                "buffered" if optimized_batch else f"{first_token_seconds or 0:.3f}s"
+            )
             print(
                 "[muscriptor] generation batch: "
                 f"{batch_number}/{total_batches} chunks={n} gap={batch_gap:.3f}s "
-                f"first_token={(first_token_seconds or 0):.3f}s "
+                f"first_token={first_token} "
                 f"wall={batch_seconds:.2f}s steps={generated_steps} "
-                f"model_tokens={model_tokens} throughput={model_tokens / max(batch_seconds, 1e-9):.1f}tok/s "
+                f"scheduled_tokens={scheduled_tokens} useful_tokens={useful_tokens} "
+                f"waste={waste_percentage:.1f}% "
+                f"scheduled_throughput={scheduled_tokens / max(batch_seconds, 1e-9):.1f}tok/s "
+                f"useful_throughput={useful_tokens / max(batch_seconds, 1e-9):.1f}tok/s "
+                f"compactions={generation_stats.get('compactions', 0)} "
+                f"saved_row_steps={generation_stats.get('saved_row_steps', 0)} "
                 f"eos_steps_min/mean/max={eos_summary}{memory}",
                 file=sys.stderr,
             )
@@ -717,6 +764,7 @@ class TranscriptionModel:
         beam_size: int = 1,
         prelude_forcing: bool = True,
         detect_tempo: TempoDetection = "best-effort",
+        optimized_decoding: bool | None = None,
     ) -> bytes:
         """Same as :meth:`transcribe` but returns a MIDI file as bytes."""
         beat_grid = self.detect_beat_grid_for(audio, detect_tempo)
@@ -730,6 +778,7 @@ class TranscriptionModel:
             no_eos_is_ok=no_eos_is_ok,
             beam_size=beam_size,
             prelude_forcing=prelude_forcing,
+            optimized_decoding=optimized_decoding,
         )
         return self.events_to_midi_bytes(events, beat_grid=beat_grid)
 

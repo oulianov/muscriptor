@@ -12,6 +12,7 @@ at known offsets.  No magic context manager, no implicit per-module storage.
 
 from abc import ABC, abstractmethod
 from typing import Any
+import torch
 from torch import nn
 
 
@@ -25,7 +26,13 @@ class StatefulModule(ABC, nn.Module):
         self._module_absolute_name: str | None = None
 
     @abstractmethod
-    def init_state(self, batch_size: int, sequence_length: int) -> State:
+    def init_state(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        *,
+        initialize_cache: bool = True,
+    ) -> State:
         raise NotImplementedError
 
     def increment_step(self, state: State, increment: int = 1) -> None:
@@ -37,7 +44,13 @@ class StatefulModule(ABC, nn.Module):
         return model_state.get(self._module_absolute_name)
 
 
-def init_states(model: nn.Module, batch_size: int, sequence_length: int) -> ModelState:
+def init_states(
+    model: nn.Module,
+    batch_size: int,
+    sequence_length: int,
+    *,
+    initialize_cache: bool = True,
+) -> ModelState:
     """Allocate state for every :class:`StatefulModule` reachable from ``model``.
 
     Side effect: each stateful submodule has its ``_module_absolute_name`` set
@@ -47,7 +60,11 @@ def init_states(model: nn.Module, batch_size: int, sequence_length: int) -> Mode
     for module_name, module in model.named_modules():
         if isinstance(module, StatefulModule):
             module._module_absolute_name = module_name
-            result[module_name] = module.init_state(batch_size, sequence_length)
+            result[module_name] = module.init_state(
+                batch_size,
+                sequence_length,
+                initialize_cache=initialize_cache,
+            )
     return result
 
 
@@ -66,3 +83,21 @@ def increment_steps(
             and module._module_absolute_name is not None
         ):
             module.increment_step(model_state[module._module_absolute_name], increment)
+
+
+def compact_states(model_state: ModelState, keep: torch.Tensor) -> None:
+    """Drop inactive batch rows while preserving every live KV prefix."""
+    for state in model_state.values():
+        cache = state.get("cache")
+        if not isinstance(cache, torch.Tensor):
+            continue
+        used_sequence = int(state["offset"])
+        compacted_cache = torch.empty(
+            (cache.shape[0], keep.numel(), *cache.shape[2:]),
+            device=cache.device,
+            dtype=cache.dtype,
+        )
+        compacted_cache[:, :, :used_sequence].copy_(
+            cache[:, :, :used_sequence].index_select(1, keep)
+        )
+        state["cache"] = compacted_cache
