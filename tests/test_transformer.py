@@ -60,6 +60,8 @@ def test_streaming_transformer_streaming_mode():
     model.eval()
     x = torch.randn(1, 6, 32)
 
+    with torch.no_grad():
+        full_out = model(x)
     model_state = init_states(model, batch_size=1, sequence_length=x.shape[1])
     streaming_outs = []
     with torch.no_grad():
@@ -70,6 +72,28 @@ def test_streaming_transformer_streaming_mode():
     streaming_out = torch.cat(streaming_outs, dim=1)
 
     assert streaming_out.shape == (1, 6, 32)
+    assert torch.allclose(streaming_out, full_out, atol=1e-5, rtol=1e-5)
+
+
+def test_streaming_state_cursors_do_not_live_on_the_accelerator():
+    """Token decoding must not synchronize a device scalar in every layer."""
+    model = _make_transformer()
+    state = init_states(model, batch_size=2, sequence_length=8)
+
+    cursors = [
+        module_state["offset"]
+        for module_state in state.values()
+        if "offset" in module_state
+    ]
+    assert cursors
+    assert all(isinstance(cursor, int) for cursor in cursors)
+
+    increment_steps(model, state, increment=3)
+    assert all(
+        module_state["offset"] == 3
+        for module_state in state.values()
+        if "offset" in module_state
+    )
 
 
 def test_streaming_transformer_fresh_state():
