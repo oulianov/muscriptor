@@ -18,7 +18,14 @@ from muscriptor.transcription_model import TranscriptionModel
 EOS = 99
 
 
-def _run(batches, *, batch_size, seek_times, no_eos_is_ok=False):
+def _run(
+    batches,
+    *,
+    batch_size,
+    seek_times,
+    no_eos_is_ok=False,
+    optimized_decoding=False,
+):
     """Drive _generate_token_stream with a fake model.
 
     ``batches`` is one list of rows per expected ``generate()`` call; each row
@@ -49,6 +56,7 @@ def _run(batches, *, batch_size, seek_times, no_eos_is_ok=False):
         temperature=1.0,
         cfg_coef=2.0,
         no_eos_is_ok=no_eos_is_ok,
+        optimized_decoding=optimized_decoding,
     )
     return stream, pulled
 
@@ -84,6 +92,31 @@ def test_single_chunk_streams_token_by_token():
     for expected, count in [(10, 1), (11, 2), (12, 3)]:
         assert next(it) == expected
         assert len(pulled) == count
+
+
+def test_optimized_decoder_buffers_generation_but_preserves_output_order():
+    rows = [[10, 20], [11, 21], [EOS, 22], [12, 23], [13, EOS]]
+    stream, pulled = _run(
+        [rows],
+        batch_size=2,
+        seek_times=[0.0, 5.0],
+        optimized_decoding=True,
+    )
+    iterator = iter(stream)
+
+    assert next(iterator) == ChunkBoundary(0.0, 5.0)
+    assert pulled == []
+    assert next(iterator) == 10
+    assert pulled == rows
+    assert list(iterator) == [
+        11,
+        ChunkBoundary(5.0, None),
+        20,
+        21,
+        22,
+        23,
+        ProgressEvent(completed=2, total=2),
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ from muscriptor.modules.conditioners import (
 )
 from muscriptor.modules.streaming import (
     ModelState,
+    compact_states,
     increment_steps,
     init_states,
 )
@@ -274,6 +275,9 @@ class LMModel(nn.Module):
         beam_size: int = 1,
         beam_length_score_alpha: float = 0.75,
         forbidden_tokens: torch.Tensor | list[int] | None = None,
+        optimized_decoding: bool = False,
+        eos_check_interval: int = 16,
+        generation_stats: dict[str, int] | None = None,
     ) -> Iterator[torch.Tensor]:
         """Autoregressively generate tokens, yielding one timestep at a time.
 
@@ -289,6 +293,18 @@ class LMModel(nn.Module):
             assert early_stop_on_token is not None, (
                 "beam search requires early_stop_on_token"
             )
+        if optimized_decoding and (
+            beam_size != 1
+            or early_stop_on_token is None
+            or prompt is not None
+            or (cfg_coef is not None and cfg_coef != 1.0)
+        ):
+            raise ValueError(
+                "optimized decoding requires greedy/sampling generation without a "
+                "prompt, beam search, or classifier-free guidance"
+            )
+        if eos_check_interval < 1:
+            raise ValueError("eos_check_interval must be at least 1")
         device = self.emb.weight.device
 
         if forbidden_tokens is not None and not isinstance(
@@ -306,6 +322,10 @@ class LMModel(nn.Module):
             )
 
         cfg_coef = self.cfg_coef if cfg_coef is None else cfg_coef
+        if optimized_decoding and cfg_coef != 1.0:
+            raise ValueError(
+                "optimized decoding requires classifier-free guidance coefficient 1.0"
+            )
 
         # Build condition tensors (with null conditions appended for CFG)
         if conditions:
@@ -379,7 +399,10 @@ class LMModel(nn.Module):
         cache_batch_size = eff_batch * (1 if cfg_coef == 1.0 else 2)
         cache_seq_len = prepend_length + max_gen_len
         model_state = init_states(
-            self, batch_size=cache_batch_size, sequence_length=cache_seq_len
+            self,
+            batch_size=cache_batch_size,
+            sequence_length=cache_seq_len,
+            initialize_cache=not optimized_decoding,
         )
         cache_bytes = sum(
             tensor.numel() * tensor.element_size()
@@ -397,15 +420,26 @@ class LMModel(nn.Module):
             "[muscriptor] generation layout: "
             f"batch={eff_batch} cache_batch={cache_batch_size} "
             f"condition_tokens={prepend_length} cache_sequence={cache_seq_len} "
-            f"kv_cache={cache_bytes / 2**30:.2f}GiB{memory}",
+            f"kv_cache={cache_bytes / 2**30:.2f}GiB "
+            f"optimized={optimized_decoding}{memory}",
             file=sys.stderr,
         )
 
         # Accumulated log-prob scores, one per beam row.
         beam_scores = torch.zeros(eff_batch, device=device, dtype=torch.float)
 
-        # For greedy/sampling emit prompt steps now; beam search emits at the end.
-        if beam_size == 1:
+        # Optimized decoding buffers the original batch layout on the GPU while
+        # active rows are compacted. The caller receives the same shape after
+        # generation, with only one device-to-host synchronization per batch.
+        output_sequence = gen_sequence
+        active_original_indices = torch.arange(eff_batch, device=device)
+        active_finished = torch.zeros(eff_batch, device=device, dtype=torch.bool)
+        scheduled_row_steps = 0
+        compactions = 0
+
+        # For standard greedy/sampling emit prompt steps now; optimized and beam
+        # generation emit the completed sequence at the end.
+        if beam_size == 1 and not optimized_decoding:
             for t in range(start_offset):
                 yield gen_sequence[:, t + 1]
 
@@ -422,7 +456,7 @@ class LMModel(nn.Module):
 
                 if beam_size == 1:
                     # ── Standard greedy / sampling path ──────────────────
-                    if early_stop_on_token is not None:
+                    if early_stop_on_token is not None and not optimized_decoding:
                         done = (gen_sequence == early_stop_on_token).any(dim=1).all()
                         if done:
                             break
@@ -451,9 +485,58 @@ class LMModel(nn.Module):
                     next_token = torch.where(
                         this_gen_step == ungenerated, next_token, this_gen_step
                     )
+                    if optimized_decoding:
+                        assert early_stop_on_token is not None
+                        # Rows that reached EOS since the last checkpoint stay at
+                        # EOS until compaction rather than generating junk tokens.
+                        next_token = torch.where(
+                            active_finished,
+                            torch.full_like(next_token, early_stop_on_token),
+                            next_token,
+                        )
                     gen_sequence[:, offset + 1] = next_token
+                    scheduled_row_steps += gen_sequence.shape[0]
 
-                    yield gen_sequence[:, offset + 1]  # [num_samples]
+                    if optimized_decoding:
+                        output_sequence[active_original_indices, offset + 1] = (
+                            next_token
+                        )
+                        active_finished |= next_token == early_stop_on_token
+                        at_checkpoint = (
+                            offset - start_offset + 1
+                        ) % eos_check_interval == 0 or offset + 1 == max_gen_len
+                        if at_checkpoint:
+                            finished_count = int(active_finished.sum().item())
+                            active_count = active_finished.numel()
+                            if finished_count == active_count:
+                                break
+
+                            # Copying live KV prefixes has a real cost. Compact
+                            # after at least two rows and one quarter of the
+                            # current batch have finished, rather than on every
+                            # isolated EOS.
+                            if finished_count >= max(2, (active_count + 3) // 4):
+                                keep = (
+                                    (~active_finished).nonzero(as_tuple=False).flatten()
+                                )
+                                gen_sequence = gen_sequence.index_select(0, keep)
+                                active_original_indices = (
+                                    active_original_indices.index_select(0, keep)
+                                )
+                                cfg_conditions = {
+                                    key: (
+                                        condition.index_select(0, keep),
+                                        mask.index_select(0, keep),
+                                    )
+                                    for key, (condition, mask) in cfg_conditions.items()
+                                }
+                                compact_states(model_state, keep)
+                                active_finished = torch.zeros(
+                                    keep.numel(), device=device, dtype=torch.bool
+                                )
+                                compactions += 1
+                    else:
+                        yield gen_sequence[:, offset + 1]  # [num_samples]
 
                 else:
                     # ── Beam search step ──────────────────────────────────
@@ -559,8 +642,24 @@ class LMModel(nn.Module):
                     if (gen_sequence == early_stop_on_token).any(dim=-1).all():
                         break
 
+        if generation_stats is not None:
+            generation_stats.update(
+                {
+                    "scheduled_row_steps": scheduled_row_steps,
+                    "compactions": compactions,
+                    "saved_row_steps": max(
+                        0,
+                        eff_batch * max(0, last_offset - start_offset + 1)
+                        - scheduled_row_steps,
+                    ),
+                }
+            )
+
+        if optimized_decoding:
+            for t in range(last_offset + 1):
+                yield output_sequence[:, t + 1]
         # Beam search: select best beam per sample and yield all tokens at once
-        if beam_size > 1:
+        elif beam_size > 1:
             best_beam = beam_scores.reshape(num_samples, beam_size).argmax(dim=-1)
             best_global = (
                 torch.arange(num_samples, device=device) * beam_size + best_beam

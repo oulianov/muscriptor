@@ -44,14 +44,35 @@ class StreamingMultiheadAttention(StatefulModule):
         self.in_proj_bias = in_proj.bias
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False, **factory_kwargs)
 
-    def init_state(self, batch_size: int, sequence_length: int) -> State:
+    def init_state(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        *,
+        initialize_cache: bool = True,
+    ) -> State:
         weight = self.in_proj_weight
+        cache_shape = (
+            2,
+            batch_size,
+            sequence_length,
+            self.num_heads,
+            self.dim_per_head,
+        )
         return {
-            "cache": torch.full(
-                (2, batch_size, sequence_length, self.num_heads, self.dim_per_head),
-                float("nan"),
-                device=weight.device,
-                dtype=weight.dtype,
+            "cache": (
+                torch.full(
+                    cache_shape,
+                    float("nan"),
+                    device=weight.device,
+                    dtype=weight.dtype,
+                )
+                if initialize_cache
+                else torch.empty(
+                    cache_shape,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                )
             ),
             # All rows advance together during autoregressive decoding. Keep
             # this cursor on the CPU: reading a CUDA scalar with .item() here
@@ -178,7 +199,14 @@ class StreamingTransformer(StatefulModule):
             ]
         )
 
-    def init_state(self, batch_size: int, sequence_length: int) -> State:
+    def init_state(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        *,
+        initialize_cache: bool = True,
+    ) -> State:
+        del batch_size, sequence_length, initialize_cache
         return {
             # Generation advances every batch row by the same amount. A Python
             # cursor avoids launching a tiny CUDA addition for every token.
