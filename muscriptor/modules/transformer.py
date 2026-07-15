@@ -60,7 +60,7 @@ class StreamingMultiheadAttention(StatefulModule):
         }
 
     def increment_step(self, state: State, increment: int = 1) -> None:
-        state["offset"] = state["offset"] + increment
+        state["offset"] += increment
 
     def _complete_kv(self, k, v, state: State | None):
         if state is None:
@@ -179,13 +179,14 @@ class StreamingTransformer(StatefulModule):
         )
 
     def init_state(self, batch_size: int, sequence_length: int) -> State:
-        device = self.layers[0].norm2.weight.device
         return {
-            "offsets": torch.zeros(batch_size, dtype=torch.long, device=device),
+            # Generation advances every batch row by the same amount. A Python
+            # cursor avoids launching a tiny CUDA addition for every token.
+            "offset": 0,
         }
 
     def increment_step(self, state: State, increment: int = 1) -> None:
-        state["offsets"] = state["offsets"] + increment
+        state["offset"] += increment
 
     def forward(
         self,
@@ -193,17 +194,12 @@ class StreamingTransformer(StatefulModule):
         prepend_length: int = 0,
         model_state: ModelState | None = None,
     ):
-        del prepend_length  # unused; positions come from state['offsets']
-        B, T, C = x.shape
+        del prepend_length  # unused; positions come from the state cursor
+        _, T, C = x.shape
         state = self.get_state(model_state)
-        offsets = (
-            state["offsets"]
-            if state is not None
-            else torch.zeros(B, dtype=torch.long, device=x.device)
-        )
-
         positions = torch.arange(T, device=x.device).view(1, -1, 1)
-        positions = positions + offsets.view(-1, 1, 1)
+        if state is not None:
+            positions = positions + state["offset"]
         # Always compute the sinusoidal embedding in fp32: fp16 cannot even
         # represent odd integers above 2048, so half-precision positions would
         # collapse neighbouring timesteps to the same embedding.
