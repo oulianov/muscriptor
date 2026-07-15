@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -458,6 +459,12 @@ class TranscriptionModel:
         """
         eos_id = self._tokenizer.eos_id
         num_chunks = len(seek_times)
+        total_batches = math.ceil(num_chunks / batch_size)
+        profile_steps = max(
+            0, int(os.environ.get("MUSCRIPTOR_TORCH_PROFILE_STEPS", "0"))
+        )
+        profiled_operator_batch = False
+        previous_batch_finished_at = time.perf_counter()
 
         def boundary(chunk_index: int) -> ChunkBoundary:
             next_seek_time = (
@@ -470,41 +477,123 @@ class TranscriptionModel:
             n = len(batch_conditions)
             buffers: list[list[int]] = [[] for _ in range(n)]
             done = [False] * n
+            eos_steps: list[int | None] = [None] * n
             active = 0  # within-batch index of the chunk streaming live
+            batch_number = batch_start // batch_size + 1
+            batch_gap = time.perf_counter() - previous_batch_finished_at
+            batch_started_at = time.perf_counter()
+            first_token_seconds: float | None = None
+            generated_steps = 0
+            operator_profile = None
+            operator_profile_table: str | None = None
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self._device)
+                torch.cuda.reset_peak_memory_stats(self._device)
+                if profile_steps > 0 and not profiled_operator_batch:
+                    profiled_operator_batch = True
+                    operator_profile = torch.profiler.profile(
+                        activities=[
+                            torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        record_shapes=True,
+                        profile_memory=True,
+                        with_stack=False,
+                    )
+                    operator_profile.__enter__()
 
             # The first chunk in the batch streams live from the start.
             yield boundary(batch_start)
 
-            for step in self._model.generate(
-                conditions=batch_conditions,
-                max_gen_len=max_gen_len,
-                use_sampling=use_sampling,
-                temp=temperature,
-                top_k=0,
-                top_p=0.0,
-                cfg_coef=cfg_coef,
-                early_stop_on_token=eos_id,
-                beam_size=beam_size,
-                forbidden_tokens=forbidden_tokens,
-            ):
-                row = step.tolist()  # one token per chunk: [n]
-                for j in range(n):
-                    if done[j]:
-                        continue
-                    tok = row[j]
-                    if tok == eos_id:
-                        done[j] = True
-                    elif j == active:
-                        yield tok
-                    else:
-                        buffers[j].append(tok)
-                # When the live chunk finishes, flush and stream the next one(s).
-                while active < n and done[active]:
-                    active += 1
-                    if active < n:
-                        yield boundary(batch_start + active)
-                        yield from buffers[active]
-                        buffers[active] = []
+            try:
+                for step in self._model.generate(
+                    conditions=batch_conditions,
+                    max_gen_len=max_gen_len,
+                    use_sampling=use_sampling,
+                    temp=temperature,
+                    top_k=0,
+                    top_p=0.0,
+                    cfg_coef=cfg_coef,
+                    early_stop_on_token=eos_id,
+                    beam_size=beam_size,
+                    forbidden_tokens=forbidden_tokens,
+                ):
+                    generated_steps += 1
+                    if first_token_seconds is None:
+                        first_token_seconds = time.perf_counter() - batch_started_at
+                    row = step.tolist()  # one token per chunk: [n]
+                    for j in range(n):
+                        if done[j]:
+                            continue
+                        tok = row[j]
+                        if tok == eos_id:
+                            done[j] = True
+                            eos_steps[j] = generated_steps
+                        elif j == active:
+                            yield tok
+                        else:
+                            buffers[j].append(tok)
+                    # When the live chunk finishes, flush and stream the next one(s).
+                    while active < n and done[active]:
+                        active += 1
+                        if active < n:
+                            yield boundary(batch_start + active)
+                            yield from buffers[active]
+                            buffers[active] = []
+
+                    if (
+                        operator_profile is not None
+                        and generated_steps >= profile_steps
+                    ):
+                        operator_profile.__exit__(None, None, None)
+                        operator_profile_table = operator_profile.key_averages().table(
+                            sort_by="self_cuda_time_total", row_limit=30
+                        )
+                        operator_profile = None
+            finally:
+                if operator_profile is not None:
+                    operator_profile.__exit__(None, None, None)
+                    operator_profile_table = operator_profile.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=30
+                    )
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self._device)
+            batch_finished_at = time.perf_counter()
+            batch_seconds = batch_finished_at - batch_started_at
+            model_tokens = generated_steps * n
+            completed_steps = [step or generated_steps for step in eos_steps]
+            eos_summary = "none"
+            if completed_steps:
+                eos_summary = (
+                    f"{min(completed_steps)}/"
+                    f"{sum(completed_steps) / len(completed_steps):.1f}/"
+                    f"{max(completed_steps)}"
+                )
+            memory = ""
+            if torch.cuda.is_available():
+                memory = (
+                    f" allocated={torch.cuda.memory_allocated(self._device) / 2**30:.2f}GiB"
+                    f" reserved={torch.cuda.memory_reserved(self._device) / 2**30:.2f}GiB"
+                    f" peak_allocated={torch.cuda.max_memory_allocated(self._device) / 2**30:.2f}GiB"
+                    f" peak_reserved={torch.cuda.max_memory_reserved(self._device) / 2**30:.2f}GiB"
+                )
+            print(
+                "[muscriptor] generation batch: "
+                f"{batch_number}/{total_batches} chunks={n} gap={batch_gap:.3f}s "
+                f"first_token={(first_token_seconds or 0):.3f}s "
+                f"wall={batch_seconds:.2f}s steps={generated_steps} "
+                f"model_tokens={model_tokens} throughput={model_tokens / max(batch_seconds, 1e-9):.1f}tok/s "
+                f"eos_steps_min/mean/max={eos_summary}{memory}",
+                file=sys.stderr,
+            )
+            if operator_profile_table:
+                print(
+                    f"[muscriptor] torch operator profile (first {min(generated_steps, profile_steps)} generation steps):\n"
+                    f"{operator_profile_table}",
+                    file=sys.stderr,
+                )
+            previous_batch_finished_at = batch_finished_at
 
             # Any chunk still open never emitted EOS within max_gen_len.
             for j in range(active, n):
