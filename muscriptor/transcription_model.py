@@ -289,11 +289,8 @@ class TranscriptionModel:
                 (CUDA, MPS, ...) if one is available, else CPU.
             dtype: Transformer weight/compute dtype: ``"float32"``,
                 ``"float16"``, ``"bfloat16"`` (or the torch dtypes). ``None``
-                picks per device: float16 on MPS (halves memory traffic —
-                decode is bandwidth-bound), float32 elsewhere (CUDA gets fp16
-                compute via autocast instead). The conditioning pipeline
-                (mel-spectrogram/class embeddings) always stays in fp32; its
-                outputs are cast at the transformer boundary.
+                uses float16 on CUDA/MPS and float32 on CPU. The conditioning
+                pipeline stays in fp32 and is cast at the transformer boundary.
         """
         if device is None:
             device = (
@@ -303,9 +300,12 @@ class TranscriptionModel:
             )
         elif isinstance(device, str):
             device = torch.device(device)
-
         if dtype is None:
-            dtype = torch.float16 if device.type == "mps" else torch.float32
+            dtype = (
+                torch.float16
+                if device.type in {"cuda", "mps"}
+                else torch.float32
+            )
         elif isinstance(dtype, str):
             dtype = getattr(torch, dtype)
 
@@ -314,15 +314,19 @@ class TranscriptionModel:
         model = _build_model(device, _resolve_config(source, weights_path))
         model.eval()
 
-        state_dict = load_file(weights_path, device=str(device))
+        # Loading through CPU avoids keeping a second checkpoint-sized copy on
+        # the GPU while parameters are populated.
+        state_dict = load_file(weights_path, device="cpu")
         state_dict = _remap_single_codebook_keys(state_dict)
         model.load_state_dict(state_dict)
-        model.to(device)
+        del state_dict
+        model.to(device=device, dtype=dtype)
         if dtype != torch.float32:
-            model.to(dtype)
             # Conditioners keep fp32 numerics (log-mel of quiet passages
             # underflows in fp16); LMModel.forward casts their outputs.
             model.condition_provider.float()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         tokenizer = MT3Tokenizer(
             instrument_vocabulary="MT3_FULL_PLUS",
