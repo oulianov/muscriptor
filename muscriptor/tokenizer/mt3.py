@@ -1,6 +1,6 @@
 """MT3 MIDI tokenizer.
 
-Adapted from YourMT3+ (https://github.com/mimbres/YourMT3) and audiocraft_trans.
+Adapted from YourMT3+ (C) and audiocraft_trans.
 """
 
 import difflib

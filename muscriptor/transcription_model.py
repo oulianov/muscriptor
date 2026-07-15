@@ -84,6 +84,7 @@ def _resolve_source(weights_path: str | Path | None) -> str | Path:
         return _HF_REPO_TEMPLATE.format(size=weights_path)
     return weights_path
 
+
 _SAMPLE_RATE = 16000
 # Must match the segment duration used during training / evaluation.
 _SEGMENT_DURATION = 5.0
@@ -267,6 +268,7 @@ class TranscriptionModel:
         cls,
         weights_path: str | Path | None = None,
         device: str | torch.device | None = None,
+        dtype: torch.dtype | None = None,
     ) -> "TranscriptionModel":
         """Load model weights and return a ready-to-use TranscriptionModel.
 
@@ -277,21 +279,36 @@ class TranscriptionModel:
                 default ``medium`` variant is downloaded from HuggingFace.
                 Remote URLs are cached under ~/.cache/muscriptor/.
             device: Torch device to use.  Defaults to CUDA if available.
+            dtype: Optional inference dtype for model weights and KV caches.
+                Defaults to ``torch.float16`` on CUDA and the checkpoint dtype
+                on CPU. The mel spectrogram frontend remains float32.
         """
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         elif isinstance(device, str):
             device = torch.device(device)
+        if dtype is None and device.type == "cuda":
+            dtype = torch.float16
 
         source = _resolve_source(weights_path)
         weights_path = download_if_necessary(source)
         model = _build_model(device, _resolve_config(source, weights_path))
         model.eval()
 
-        state_dict = load_file(weights_path, device=str(device))
+        # Loading through CPU avoids keeping a second checkpoint-sized copy on
+        # the GPU while parameters are populated.
+        state_dict = load_file(weights_path, device="cpu")
         state_dict = _remap_single_codebook_keys(state_dict)
         model.load_state_dict(state_dict)
-        model.to(device)
+        del state_dict
+        model.to(device=device, dtype=dtype)
+        if dtype is not None and dtype != torch.float32:
+            # torch.stft on CUDA needs its waveform/window in float32. The
+            # projected mel embeddings are converted to the model dtype by the
+            # conditioner before entering the transformer.
+            model.condition_provider.conditioners["self_wav"].mel_spec_transform.float()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         tokenizer = MT3Tokenizer(
             instrument_vocabulary="MT3_FULL_PLUS",
