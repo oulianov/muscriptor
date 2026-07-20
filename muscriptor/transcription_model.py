@@ -451,6 +451,7 @@ class TranscriptionModel:
                 beam_size,
                 optimized_decoding,
                 forbidden_tokens,
+                audio_end_time=total_duration,
             ),
             self._tokenizer._vocab,
             self._instrument_for_program,
@@ -503,6 +504,7 @@ class TranscriptionModel:
         beam_size: int = 1,
         optimized_decoding: bool = False,
         forbidden_tokens: torch.Tensor | None = None,
+        audio_end_time: float | None = None,
     ) -> Iterator[int | ChunkBoundary | ProgressEvent]:
         """Generate tokens and yield them per chunk, as soon as they are ready.
 
@@ -545,6 +547,8 @@ class TranscriptionModel:
             next_seek_time = (
                 seek_times[chunk_index + 1] if chunk_index + 1 < num_chunks else None
             )
+            if next_seek_time is None:
+                next_seek_time = audio_end_time
             return ChunkBoundary(seek_times[chunk_index], next_seek_time)
 
         for batch_start in range(0, num_chunks, batch_size):

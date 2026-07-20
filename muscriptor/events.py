@@ -13,7 +13,6 @@ from muscriptor.tokenizer.notes import (
     Event,
 )
 
-
 _DRUM_INSTRUMENT = "drums"
 
 
@@ -56,8 +55,9 @@ class ChunkBoundary:
     """Marks the start of a new model-output chunk in the token stream.
 
     ``seek_time`` is the chunk's start time in seconds; ``next_seek_time`` is
-    the following chunk's start (``None`` for the last chunk), used to drop
-    events the model emits past its window.
+    the exclusive end of the chunk's usable audio. This is normally the next
+    chunk's start and, for the final chunk, the source audio duration. ``None``
+    is retained for callers that do not know the final duration.
     """
 
     seek_time: float
