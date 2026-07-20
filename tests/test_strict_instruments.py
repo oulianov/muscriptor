@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from muscriptor.models.lm import LMModel
 from muscriptor.modules.conditioners import ConditioningProvider
 from muscriptor.tokenizer.mt3 import MT3_FULL_PLUS_GROUP_NAMES, MT3Tokenizer
@@ -171,7 +170,7 @@ def _forbidden_tokens_used_by_transcribe(instruments, tokenizer):
         def _build_conditions(self, wav, instrument_group=None):
             return [SimpleNamespace()]
 
-        def _generate_token_stream(self, *args):
+        def _generate_token_stream(self, *args, **kwargs):
             captured["forbidden_tokens"] = args[-1]
             return iter([])
 

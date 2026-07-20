@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from muscriptor.events import ChunkBoundary, ProgressEvent
 from muscriptor.transcription_model import TranscriptionModel
 
@@ -25,6 +24,7 @@ def _run(
     seek_times,
     no_eos_is_ok=False,
     optimized_decoding=False,
+    audio_end_time=None,
 ):
     """Drive _generate_token_stream with a fake model.
 
@@ -57,6 +57,7 @@ def _run(
         cfg_coef=2.0,
         no_eos_is_ok=no_eos_is_ok,
         optimized_decoding=optimized_decoding,
+        audio_end_time=audio_end_time,
     )
     return stream, pulled
 
@@ -92,6 +93,20 @@ def test_single_chunk_streams_token_by_token():
     for expected, count in [(10, 1), (11, 2), (12, 3)]:
         assert next(it) == expected
         assert len(pulled) == count
+
+
+def test_final_chunk_uses_source_audio_end_as_its_exclusive_cutoff():
+    rows = [[10, 20], [EOS, 21], [30, EOS]]
+    stream, _ = _run(
+        [rows],
+        batch_size=2,
+        seek_times=[0.0, 5.0],
+        audio_end_time=7.35,
+    )
+
+    boundaries = [item for item in stream if isinstance(item, ChunkBoundary)]
+
+    assert boundaries == [ChunkBoundary(0.0, 5.0), ChunkBoundary(5.0, 7.35)]
 
 
 def test_optimized_decoder_buffers_generation_but_preserves_output_order():

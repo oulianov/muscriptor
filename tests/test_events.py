@@ -6,6 +6,7 @@ to `decode_model_tokens` — exercising the streaming decoder end to end without
 a model or audio.
 """
 
+import pytest
 from muscriptor.events import (
     ChunkBoundary,
     NoteEndEvent,
@@ -18,6 +19,7 @@ from muscriptor.tokenizer.notes import (
     TieNoteEvent,
     build_event_vocab,
 )
+
 from tests.encode_helpers import encode_note_events
 
 # Match the model's shift range so within-chunk shifts (up to ~500 ticks) encode.
@@ -236,3 +238,120 @@ def test_every_start_has_exactly_one_end():
     end_ids = {e.start_event_index for e in ends}
     assert start_ids == end_ids
     assert len(start_ids) == len(starts), "indices must be unique"
+
+
+# ---------------------------------------------------------------------------
+# Long-timeline stitching regressions
+# ---------------------------------------------------------------------------
+
+
+def test_210_second_timeline_preserves_attacks_without_cumulative_drift():
+    """Exercise all 42 production-sized chunks without invoking the model."""
+    song_duration = 210.0
+    expected_attacks: list[float] = []
+    chunks = []
+    for chunk_index in range(42):
+        seek_time = chunk_index * 5.0
+        note_events: list[NoteEvent] = []
+        for note_index, offset in enumerate((0.0, 0.01, 1.13, 2.67, 4.98)):
+            attack = seek_time + offset
+            pitch = 36 + (chunk_index * 5 + note_index) % 48
+            note_events.extend([_on(attack, 0, pitch), _off(attack + 0.01, 0, pitch)])
+            expected_attacks.append(attack)
+        chunks.append((note_events, [], seek_time, min(seek_time + 5.0, song_duration)))
+
+    events = _decode(*chunks)
+    starts = [event for event in events if isinstance(event, NoteStartEvent)]
+    ends = [event for event in events if isinstance(event, NoteEndEvent)]
+
+    assert [event.start_time for event in starts] == pytest.approx(
+        expected_attacks, abs=1e-9
+    )
+    assert [event.index for event in starts] == list(range(len(expected_attacks)))
+    assert len(ends) == len(starts)
+    assert all(end.end_time > end.start_event.start_time for end in ends)
+    assert max(end.end_time for end in ends) <= song_duration
+
+
+def test_exact_boundary_attacks_are_owned_by_one_chunk_without_duplicates():
+    """A model may repeat a boundary event in both adjacent chunk outputs."""
+    chunks = []
+    expected_attacks = [chunk_index * 5.0 for chunk_index in range(1, 42)]
+    for chunk_index in range(42):
+        seek_time = chunk_index * 5.0
+        note_events: list[NoteEvent] = []
+        if chunk_index > 0:
+            pitch = 48 + chunk_index % 24
+            note_events.extend(
+                [_on(seek_time, 0, pitch), _off(seek_time + 0.01, 0, pitch)]
+            )
+        if chunk_index < 41:
+            # This duplicate belongs to the next chunk and must be discarded
+            # by the current chunk's exclusive end boundary.
+            next_seek_time = seek_time + 5.0
+            pitch = 48 + (chunk_index + 1) % 24
+            note_events.extend(
+                [
+                    _on(next_seek_time, 0, pitch),
+                    _off(next_seek_time + 0.01, 0, pitch),
+                ]
+            )
+        chunks.append((note_events, [], seek_time, seek_time + 5.0))
+
+    events = _decode(*chunks)
+    starts = [event for event in events if isinstance(event, NoteStartEvent)]
+
+    assert [event.start_time for event in starts] == expected_attacks
+    assert len({(event.start_time, event.pitch) for event in starts}) == 41
+
+
+def test_sustain_and_same_pitch_reattack_survive_a_chunk_boundary():
+    events = _decode(
+        ([_on(4.99, 0, 60)], [], 0.0, 5.0),
+        (
+            [
+                _off(5.01, 0, 60),
+                _on(5.01, 0, 60),
+                _off(5.02, 0, 60),
+                _drum(5.0, 36),
+            ],
+            [TieNoteEvent(program=0, pitch=60)],
+            5.0,
+            10.0,
+        ),
+    )
+    starts = [event for event in events if isinstance(event, NoteStartEvent)]
+    ends = [event for event in events if isinstance(event, NoteEndEvent)]
+
+    assert [(event.pitch, event.start_time) for event in starts] == [
+        (60, 4.99),
+        (36, 5.0),
+        (60, 5.01),
+    ]
+    assert [(event.start_event.pitch, event.end_time) for event in ends] == [
+        (36, 5.01),
+        (60, 5.01),
+        (60, 5.02),
+    ]
+
+
+def test_final_chunk_rejects_notes_at_or_beyond_the_source_duration():
+    events = _decode(
+        (
+            [
+                _on(209.98, 0, 60),
+                _off(209.99, 0, 60),
+                _on(210.0, 0, 61),
+                _on(210.01, 0, 62),
+            ],
+            [],
+            205.0,
+            210.0,
+        )
+    )
+
+    assert [
+        (event.pitch, event.start_time)
+        for event in events
+        if isinstance(event, NoteStartEvent)
+    ] == [(60, 209.98)]
