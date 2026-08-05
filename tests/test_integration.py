@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 import torch
-
 from muscriptor.events import NoteEndEvent, NoteStartEvent, ProgressEvent
+
 from .conftest import SONG_PATH
 
 # Model constants
@@ -20,7 +20,7 @@ _SAMPLE_RATE = 16000
 _SEGMENT_DURATION = 5  # seconds — must match transcription_model._SEGMENT_DURATION
 # One full segment (5 s) is the natural test size; shorter clips are padded internally.
 _DURATION_SEC = _SEGMENT_DURATION
-# Use exactly two segments for the song clip so we exercise the multi-chunk path.
+# Ten seconds produces three overlapping windows and exercises the multi-chunk path.
 _SONG_CLIP_SEC = 10
 
 
@@ -189,9 +189,8 @@ def test_cli_json_output(transcription_model, silence, monkeypatch):
     import json
     import wave
 
-    from typer.testing import CliRunner
-
     from muscriptor import main as cli_main
+    from typer.testing import CliRunner
 
     monkeypatch.setattr(
         cli_main.TranscriptionModel,

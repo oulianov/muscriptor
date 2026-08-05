@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from muscriptor.events import ChunkBoundary, ProgressEvent
-from muscriptor.transcription_model import TranscriptionModel
+from muscriptor.transcription_model import TranscriptionModel, _split_audio_chunks
 from muscriptor.utils.beats import BeatDetectionError
 
 EOS = 99
@@ -26,6 +26,7 @@ def _run(
     no_eos_is_ok=False,
     optimized_decoding=False,
     audio_end_time=None,
+    chunk_boundaries=None,
 ):
     """Drive _generate_token_stream with a fake model.
 
@@ -46,11 +47,23 @@ def _run(
         _model=SimpleNamespace(generate=generate),
         _tokenizer=SimpleNamespace(eos_id=EOS),
     )
-    conditions = [object()] * len(seek_times)
+    if chunk_boundaries is None:
+        chunk_boundaries = [
+            ChunkBoundary(
+                seek_time,
+                (
+                    seek_times[index + 1]
+                    if index + 1 < len(seek_times)
+                    else audio_end_time
+                ),
+            )
+            for index, seek_time in enumerate(seek_times)
+        ]
+    conditions = [object()] * len(chunk_boundaries)
     stream = TranscriptionModel._generate_token_stream(
         fake,
         conditions,
-        seek_times,
+        chunk_boundaries,
         batch_size,
         max_gen_len=64,
         use_sampling=False,
@@ -61,9 +74,38 @@ def _run(
         # (test_prelude_forcing.py).
         prelude_forcing=False,
         optimized_decoding=optimized_decoding,
-        audio_end_time=audio_end_time,
     )
     return stream, pulled
+
+
+# ---------------------------------------------------------------------------
+# Audio chunk construction
+# ---------------------------------------------------------------------------
+
+
+def test_audio_chunks_have_half_second_context_around_four_second_cores():
+    sample_rate = 16_000
+    wav = torch.arange(9 * sample_rate, dtype=torch.float32).unsqueeze(0)
+
+    chunks, boundaries = _split_audio_chunks(wav)
+
+    assert boundaries == [
+        ChunkBoundary(-0.5, 4.0, 0.0),
+        ChunkBoundary(3.5, 8.0, 4.0),
+        ChunkBoundary(7.5, 9.0, 8.0),
+    ]
+    assert all(chunk.shape == (1, 5 * sample_rate) for chunk in chunks)
+    assert torch.count_nonzero(chunks[0][:, : sample_rate // 2]) == 0
+    assert torch.equal(
+        chunks[0][:, sample_rate // 2 :], wav[:, : int(4.5 * sample_rate)]
+    )
+    assert torch.equal(
+        chunks[1], wav[:, int(3.5 * sample_rate) : int(8.5 * sample_rate)]
+    )
+    assert torch.equal(
+        chunks[2][:, : int(1.5 * sample_rate)], wav[:, int(7.5 * sample_rate) :]
+    )
+    assert torch.count_nonzero(chunks[2][:, int(1.5 * sample_rate) :]) == 0
 
 
 # ---------------------------------------------------------------------------

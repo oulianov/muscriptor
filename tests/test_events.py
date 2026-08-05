@@ -46,14 +46,20 @@ def _drum(time: float, pitch: int) -> NoteEvent:
 def _decode(*chunks) -> list[NoteStartEvent | NoteEndEvent]:
     """Decode a sequence of chunks through the streaming decoder.
 
-    Each chunk is ``(note_events, tie_note_events, seek_time, next_seek_time)``;
-    it is encoded to tokens (tie prologue included) and prefixed with a
-    ChunkBoundary, then the whole stream is decoded in one pass.
+    Each chunk is ``(note_events, tie_note_events, seek_time, next_seek_time)``
+    with an optional fifth ``usable_start_time`` value. It is encoded to tokens
+    (tie prologue included) and prefixed with a ChunkBoundary, then the whole
+    stream is decoded in one pass.
     """
 
     def stream():
-        for note_events, tie_notes, seek, next_seek in chunks:
-            yield ChunkBoundary(seek, next_seek)
+        for chunk in chunks:
+            note_events, tie_notes, seek, next_seek, *usable_start = chunk
+            yield ChunkBoundary(
+                seek,
+                next_seek,
+                usable_start[0] if usable_start else None,
+            )
             yield from encode_note_events(
                 note_events,
                 max_shift_steps=_MAX_SHIFT_STEPS,
@@ -246,19 +252,24 @@ def test_every_start_has_exactly_one_end():
 
 
 def test_210_second_timeline_preserves_attacks_without_cumulative_drift():
-    """Exercise all 42 production-sized chunks without invoking the model."""
+    """Exercise all 53 production output cores without invoking the model."""
     song_duration = 210.0
     expected_attacks: list[float] = []
     chunks = []
-    for chunk_index in range(42):
-        seek_time = chunk_index * 5.0
+    for chunk_index in range(53):
+        usable_start = chunk_index * 4.0
+        usable_end = min(usable_start + 4.0, song_duration)
         note_events: list[NoteEvent] = []
-        for note_index, offset in enumerate((0.0, 0.01, 1.13, 2.67, 4.98)):
-            attack = seek_time + offset
+        for note_index, offset in enumerate((0.0, 0.01, 1.13, 2.67, 3.98)):
+            attack = usable_start + offset
+            if attack + 0.01 >= usable_end:
+                continue
             pitch = 36 + (chunk_index * 5 + note_index) % 48
             note_events.extend([_on(attack, 0, pitch), _off(attack + 0.01, 0, pitch)])
             expected_attacks.append(attack)
-        chunks.append((note_events, [], seek_time, min(seek_time + 5.0, song_duration)))
+        chunks.append(
+            (note_events, [], usable_start - 0.5, usable_end, usable_start)
+        )
 
     events = _decode(*chunks)
     starts = [event for event in events if isinstance(event, NoteStartEvent)]
@@ -276,19 +287,22 @@ def test_210_second_timeline_preserves_attacks_without_cumulative_drift():
 def test_exact_boundary_attacks_are_owned_by_one_chunk_without_duplicates():
     """A model may repeat a boundary event in both adjacent chunk outputs."""
     chunks = []
-    expected_attacks = [chunk_index * 5.0 for chunk_index in range(1, 42)]
-    for chunk_index in range(42):
-        seek_time = chunk_index * 5.0
+    expected_attacks = [chunk_index * 4.0 for chunk_index in range(1, 53)]
+    for chunk_index in range(53):
+        usable_start = chunk_index * 4.0
         note_events: list[NoteEvent] = []
         if chunk_index > 0:
             pitch = 48 + chunk_index % 24
             note_events.extend(
-                [_on(seek_time, 0, pitch), _off(seek_time + 0.01, 0, pitch)]
+                [
+                    _on(usable_start, 0, pitch),
+                    _off(usable_start + 0.01, 0, pitch),
+                ]
             )
-        if chunk_index < 41:
+        if chunk_index < 52:
             # This duplicate belongs to the next chunk and must be discarded
             # by the current chunk's exclusive end boundary.
-            next_seek_time = seek_time + 5.0
+            next_seek_time = usable_start + 4.0
             pitch = 48 + (chunk_index + 1) % 24
             note_events.extend(
                 [
@@ -296,13 +310,21 @@ def test_exact_boundary_attacks_are_owned_by_one_chunk_without_duplicates():
                     _off(next_seek_time + 0.01, 0, pitch),
                 ]
             )
-        chunks.append((note_events, [], seek_time, seek_time + 5.0))
+        chunks.append(
+            (
+                note_events,
+                [],
+                usable_start - 0.5,
+                usable_start + 4.0,
+                usable_start,
+            )
+        )
 
     events = _decode(*chunks)
     starts = [event for event in events if isinstance(event, NoteStartEvent)]
 
     assert [event.start_time for event in starts] == expected_attacks
-    assert len({(event.start_time, event.pitch) for event in starts}) == 41
+    assert len({(event.start_time, event.pitch) for event in starts}) == 52
 
 
 def test_sustain_and_same_pitch_reattack_survive_a_chunk_boundary():
@@ -332,6 +354,46 @@ def test_sustain_and_same_pitch_reattack_survive_a_chunk_boundary():
         (36, 5.01),
         (60, 5.01),
         (60, 5.02),
+    ]
+
+
+def test_overlapping_context_is_used_without_duplicate_midi_events():
+    events = _decode(
+        (
+            [
+                _on(3.8, 0, 60),
+                _on(4.1, 0, 64),
+                _off(4.2, 0, 60),
+                _off(4.3, 0, 64),
+            ],
+            [],
+            -0.5,
+            4.0,
+            0.0,
+        ),
+        (
+            [
+                _on(3.8, 0, 60),
+                _on(4.1, 0, 64),
+                _off(4.2, 0, 60),
+                _off(4.3, 0, 64),
+            ],
+            [],
+            3.5,
+            8.0,
+            4.0,
+        ),
+    )
+    starts = [event for event in events if isinstance(event, NoteStartEvent)]
+    ends = [event for event in events if isinstance(event, NoteEndEvent)]
+
+    assert [(event.pitch, event.start_time) for event in starts] == [
+        (60, 3.8),
+        (64, 4.1),
+    ]
+    assert [(event.start_event.pitch, event.end_time) for event in ends] == [
+        (60, 4.2),
+        (64, 4.3),
     ]
 
 

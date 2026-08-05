@@ -203,6 +203,22 @@ def test_chunk_ending_mid_prologue_closes_everything_at_next_boundary():
     _assert_open([(0.0, 5.0, chunk0), (5.0, 10.0, chunk1), (10.0, None, chunk2)], [])
 
 
+def test_overlap_forcing_uses_state_at_next_context_boundary():
+    tracker = OpenNoteTracker(_VOCAB)
+    tracker.feed(ChunkBoundary(-0.5, 4.0, 0.0))
+    tokens = _encode(
+        [_on(3.0, 0, 60), _off(3.8, 0, 60)],
+        start_time=-0.5,
+    )
+    for token in tokens:
+        tracker.feed(token)
+
+    # The assembled note has ended before the 4.0s core boundary, but the next
+    # model window begins at 3.5s, when it was still active.
+    assert tracker.open_keys() == []
+    assert tracker.next_chunk_open_keys() == [(0, 60)]
+
+
 # ---------------------------------------------------------------------------
 # _resolve_batch_size: prelude forcing is the quality default
 # ---------------------------------------------------------------------------
@@ -262,11 +278,18 @@ def _run_stream(scripts, tokenizer, *, seek_times, batch_size=1, prelude_forcing
         _tokenizer=tokenizer,
         _device=torch.device("cpu"),
     )
+    boundaries = [
+        ChunkBoundary(
+            seek,
+            seek_times[index + 1] if index + 1 < len(seek_times) else None,
+        )
+        for index, seek in enumerate(seek_times)
+    ]
     stream = list(
         TranscriptionModel._generate_token_stream(
             fake,
-            [object()] * len(seek_times),
-            seek_times,
+            [object()] * len(boundaries),
+            boundaries,
             batch_size,
             max_gen_len=64,
             use_sampling=False,

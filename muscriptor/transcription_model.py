@@ -94,6 +94,47 @@ def _resolve_source(weights_path: str | Path | None) -> str | Path:
 _SAMPLE_RATE = 16000
 # Must match the segment duration used during training / evaluation.
 _SEGMENT_DURATION = 5.0
+_CHUNK_CONTEXT_DURATION = 0.5
+_CHUNK_CORE_DURATION = _SEGMENT_DURATION - 2 * _CHUNK_CONTEXT_DURATION
+
+
+def _split_audio_chunks(
+    wav: torch.Tensor,
+) -> tuple[list[torch.Tensor], list[ChunkBoundary]]:
+    """Build fixed model windows and their non-overlapping output ranges."""
+
+    total_samples = wav.shape[-1]
+    if total_samples == 0:
+        return [], []
+
+    segment_samples = round(_SEGMENT_DURATION * _SAMPLE_RATE)
+    context_samples = round(_CHUNK_CONTEXT_DURATION * _SAMPLE_RATE)
+    core_samples = round(_CHUNK_CORE_DURATION * _SAMPLE_RATE)
+    total_duration = total_samples / _SAMPLE_RATE
+    padded_wav = F.pad(wav, (context_samples, context_samples))
+    num_chunks = math.ceil(total_samples / core_samples)
+    chunks: list[torch.Tensor] = []
+    boundaries: list[ChunkBoundary] = []
+
+    for chunk_index in range(num_chunks):
+        padded_start = chunk_index * core_samples
+        chunk = padded_wav[:, padded_start : padded_start + segment_samples]
+        if chunk.shape[-1] < segment_samples:
+            chunk = F.pad(chunk, (0, segment_samples - chunk.shape[-1]))
+        core_start = chunk_index * _CHUNK_CORE_DURATION
+        chunks.append(chunk)
+        boundaries.append(
+            ChunkBoundary(
+                seek_time=core_start - _CHUNK_CONTEXT_DURATION,
+                usable_start_time=core_start,
+                next_seek_time=min(
+                    core_start + _CHUNK_CORE_DURATION,
+                    total_duration,
+                ),
+            )
+        )
+
+    return chunks, boundaries
 
 
 @dataclass
@@ -353,9 +394,11 @@ class TranscriptionModel:
         """Transcribe audio into a stream of note events.
 
         See the README for full argument documentation and the streaming /
-        chunk-ordering guarantees. The audio is split into 5-second chunks;
-        within each chunk events arrive in temporal order, and all events
-        from chunk N are yielded before any event from chunk N+1.
+        chunk-ordering guarantees. The audio is split into 5-second model
+        windows containing 0.5 seconds of context on each side of a 4-second
+        non-overlapping output range. Within each chunk events arrive in
+        temporal order, and all events from chunk N are yielded before any
+        event from chunk N+1.
 
         ``instruments``, when given, is a hard constraint: every program/drum
         token outside the listed groups is masked out during generation, so
@@ -410,26 +453,22 @@ class TranscriptionModel:
         total_samples = wav.shape[-1]
         total_duration = total_samples / _SAMPLE_RATE
 
-        segment_samples = int(_SEGMENT_DURATION * _SAMPLE_RATE)
-        num_chunks = math.ceil(total_samples / segment_samples)
+        chunks, chunk_boundaries = _split_audio_chunks(wav)
+        num_chunks = len(chunks)
         max_gen_len = 2000
         print(
-            f"[muscriptor] audio: {total_duration:.1f}s → {num_chunks} chunk(s) of {_SEGMENT_DURATION}s",
+            f"[muscriptor] audio: {total_duration:.1f}s → {num_chunks} chunk(s) "
+            f"of {_CHUNK_CONTEXT_DURATION}s context + {_CHUNK_CORE_DURATION}s core "
+            f"+ {_CHUNK_CONTEXT_DURATION}s context",
             file=sys.stderr,
         )
 
         with _timed("build conditions", timings):
             all_conditions: list[ConditioningAttributes] = []
-            seek_times: list[float] = []
-            for i in range(num_chunks):
-                start = i * segment_samples
-                chunk = wav[:, start : start + segment_samples]
-                if chunk.shape[-1] < segment_samples:
-                    chunk = F.pad(chunk, (0, segment_samples - chunk.shape[-1]))
+            for chunk in chunks:
                 all_conditions.append(
                     self._build_conditions(chunk, instrument_group)[0]
                 )
-                seek_times.append(i * _SEGMENT_DURATION)
 
         t_gen = time.perf_counter()
 
@@ -440,7 +479,7 @@ class TranscriptionModel:
         yield from decode_model_tokens(
             self._generate_token_stream(
                 all_conditions,
-                seek_times,
+                chunk_boundaries,
                 batch_size,
                 max_gen_len,
                 use_sampling,
@@ -451,7 +490,6 @@ class TranscriptionModel:
                 beam_size,
                 optimized_decoding,
                 forbidden_tokens,
-                audio_end_time=total_duration,
             ),
             self._tokenizer._vocab,
             self._instrument_for_program,
@@ -493,7 +531,7 @@ class TranscriptionModel:
     def _generate_token_stream(
         self,
         all_conditions: list[ConditioningAttributes],
-        seek_times: list[float],
+        chunk_boundaries: list[ChunkBoundary],
         batch_size: int,
         max_gen_len: int,
         use_sampling: bool,
@@ -504,7 +542,6 @@ class TranscriptionModel:
         beam_size: int = 1,
         optimized_decoding: bool = False,
         forbidden_tokens: torch.Tensor | None = None,
-        audio_end_time: float | None = None,
     ) -> Iterator[int | ChunkBoundary | ProgressEvent]:
         """Generate tokens and yield them per chunk, as soon as they are ready.
 
@@ -524,7 +561,7 @@ class TranscriptionModel:
         keeps the downstream decoder's view consistent by construction.
         """
         eos_id = self._tokenizer.eos_id
-        num_chunks = len(seek_times)
+        num_chunks = len(chunk_boundaries)
         total_batches = math.ceil(num_chunks / batch_size)
         profile_steps = max(
             0, int(os.environ.get("MUSCRIPTOR_TORCH_PROFILE_STEPS", "0"))
@@ -542,15 +579,6 @@ class TranscriptionModel:
             tracker = OpenNoteTracker(
                 self._tokenizer._vocab, self._tokenizer.frame_rate
             )
-
-        def boundary(chunk_index: int) -> ChunkBoundary:
-            next_seek_time = (
-                seek_times[chunk_index + 1] if chunk_index + 1 < num_chunks else None
-            )
-            if next_seek_time is None:
-                next_seek_time = audio_end_time
-            return ChunkBoundary(seek_times[chunk_index], next_seek_time)
-
         for batch_start in range(0, num_chunks, batch_size):
             batch_conditions = all_conditions[batch_start : batch_start + batch_size]
             n = len(batch_conditions)
@@ -582,19 +610,20 @@ class TranscriptionModel:
                     operator_profile.__enter__()
 
             # The first chunk in the batch streams live from the start.
-            bnd = boundary(batch_start)
+            bnd = chunk_boundaries[batch_start]
             prompt = None
             if tracker is not None:
-                # Feed the boundary first: it settles the tracker (e.g. a
-                # previous chunk that never emitted its tie token drops all
-                # open notes) so open_keys() is exactly the decoder's view.
-                tracker.feed(bnd)
                 if batch_start > 0:
                     prompt = torch.tensor(
-                        [self._tokenizer.tie_section_token_ids(tracker.open_keys())],
+                        [
+                            self._tokenizer.tie_section_token_ids(
+                                tracker.next_chunk_open_keys()
+                            )
+                        ],
                         device=self._device,
                         dtype=torch.long,
                     )
+                tracker.feed(bnd)
             yield bnd
 
             optimized_batch = (
@@ -627,7 +656,7 @@ class TranscriptionModel:
                 while active < n and done[active]:
                     active += 1
                     if active < n:
-                        yield boundary(batch_start + active)
+                        yield chunk_boundaries[batch_start + active]
                         yield from buffers[active]
                         buffers[active] = []
 
@@ -735,7 +764,8 @@ class TranscriptionModel:
                 if not done[j]:
                     chunk_index = batch_start + j
                     msg = (
-                        f"chunk {chunk_index} (seek={seek_times[chunk_index]:.1f}s) "
+                        f"chunk {chunk_index} "
+                        f"(seek={chunk_boundaries[chunk_index].seek_time:.1f}s) "
                         f"did not emit EOS within {max_gen_len} tokens"
                     )
                     if no_eos_is_ok:
@@ -746,7 +776,7 @@ class TranscriptionModel:
                         )
                 # The live (active) chunk has already streamed; emit the rest.
                 if j != active:
-                    yield boundary(batch_start + j)
+                    yield chunk_boundaries[batch_start + j]
                     yield from buffers[j]
 
             # This batch's chunks are fully generated: emit a completion anchor.
@@ -898,7 +928,7 @@ class TranscriptionModel:
         wav: torch.Tensor,
         instrument_group: str | None = None,
     ) -> list[ConditioningAttributes]:
-        """Build a single-element list of ConditioningAttributes for one 5-second chunk."""
+        """Build conditions for one 5-second model window."""
         T = wav.shape[-1]
         wav_3d = wav.unsqueeze(0)  # [1, 1, T]
         length = torch.tensor([T], device=self._device)

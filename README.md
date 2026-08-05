@@ -155,9 +155,11 @@ class NoteEndEvent:
 @dataclass
 class ProgressEvent:
     # A coarse progress anchor woven into the event stream: `completed` of
-    # `total` 5-second chunks have been transcribed. One is emitted up front
-    # with completed == 0 (so consumers learn `total`), then one per finished
-    # chunk. Advisory only — consumers that just build notes can ignore them.
+    # `total` model windows have been transcribed. Each window contains a
+    # 4-second output core plus 0.5 seconds of context on either side. One is
+    # emitted up front with completed == 0 (so consumers learn `total`), then
+    # one per finished chunk. Advisory only — consumers that just build notes
+    # can ignore them.
     completed: int
     total: int
 
@@ -195,17 +197,15 @@ class TranscriptionModel:
                 list is masked out during generation, so no unlisted
                 instrument can appear in the output. Leave unset to let
                 the model decode whatever instruments it detects.
-            batch_size: Number of 5-second chunks processed per forward
-                pass. `None` (default) resolves to 1 while prelude forcing
-                is on; with `prelude_forcing=False` it picks a value based
-                on the device: 1 on CPU, 4 on GPU. Values > 1 trade
-                chunk-boundary quality for throughput and therefore require
-                `prelude_forcing=False` (ValueError otherwise). Batching
-                also delays streaming: several chunks generate together, so
-                events belonging to later chunks of a batch won't arrive
-                until the whole batch finishes. Within a batch, events are
-                always yielded in temporal order; all events from chunk N
-                are emitted before any event from chunk N+1.
+            batch_size: Number of 5-second model windows processed per forward
+                pass. Each window contributes only its non-overlapping
+                4-second core to the final MIDI; the surrounding 0.5 seconds
+                on each side provide context. `None` (default) resolves to 1
+                while prelude forcing is on; with
+                `prelude_forcing=False` it picks 1 on CPU or 4 on GPU.
+                Values > 1 require `prelude_forcing=False` and delay
+                streaming: events from later chunks do not arrive until the
+                whole batch finishes. Events remain in temporal chunk order.
             no_eos_is_ok: If True, a chunk that doesn't emit EOS within
                 the generation budget produces a warning instead of raising.
             beam_size: Beam search width. 1 (default) uses greedy decoding
